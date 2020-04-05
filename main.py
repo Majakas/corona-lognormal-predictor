@@ -1,9 +1,11 @@
 import csv
 import math
 from os import path
+from copy import deepcopy
 
 import numpy as np
 from scipy.stats import lognorm
+from scipy.stats import linregress
 import matplotlib.pyplot as plt
 from lmfit import minimize, Parameters
 
@@ -40,16 +42,19 @@ class Data:
     Wrapper class for the case and death statistics.
     """
     def __init__(self, case_statistics, death_statistics):
-        self.cases = case_statistics
-        self.deaths = death_statistics
+        self.cases = None
+        self.deaths = None
+        self.x = None
         if case_statistics is not None:
             self.cases = case_statistics
+            self.x = np.arange(0, len(self.cases))
         if death_statistics is not None:
             self.deaths = death_statistics
+            self.x = np.arange(0, len(self.cases))
         if self.cases is None:
-            self.cases = np.zeros_like(self.deaths, dtype=int)
+            self.cases = np.zeros_like(self.deaths, dtype=np.float32)
         if self.deaths is None:
-            self.deaths = np.zeros_like(self.cases, dtype=int)
+            self.deaths = np.zeros_like(self.cases, dtype=np.float32)
 
     def combine(self, new_case_statistics=None, new_death_statistics=None):
         """
@@ -59,6 +64,18 @@ class Data:
             self.cases = self.cases + new_case_statistics
         if new_death_statistics is not None:
             self.deaths = self.deaths + new_death_statistics
+
+    def append(self, appended_cases=None, appended_deaths=None):
+        if appended_cases is not None:
+            self.cases = np.concatenate((self.cases, appended_cases))
+            if appended_deaths is None:
+                self.deaths = np.concatenate((self.deaths, np.zeros_like(appended_cases, dtype=np.float32)))
+            self.x = np.arange(0, len(self.cases))
+        if appended_deaths is not None:
+            self.cases = np.concatenate((self.cases, appended_deaths))
+            if appended_cases is None:
+                self.deaths = np.concatenate((self.deaths, np.zeros_like(appended_deaths, dtype=np.float32)))
+            self.x = np.arange(0, len(self.cases))
 
 
 class Country:
@@ -77,6 +94,8 @@ class Country:
         self.total_cases = np.sum(self.data.cases)
         self.total_deaths = np.sum(self.data.deaths)
 
+        self.fit = None
+
     def combine(self, new_case_statistics=None, new_death_statistics=None):
         """
         Adds case or death statistics to the country if they weren't defined during the object's declaration
@@ -85,17 +104,44 @@ class Country:
         self.total_cases = np.sum(self.data.cases)
         self.total_deaths = np.sum(self.data.deaths)
 
-    def plot_model(self, coeffs, residuals):
+    def extrapolate_cases(self, n):
+        """
+        Extrapolates the cases (not the deaths) with an exponential fit using the last 7 days)
+        """
+        x = np.arange(len(self.data.cases) - n, len(self.data.cases))
+        y = self.data.cases[-n:]
+        y = np.log(y)
+        slope, intercept, r_value, p_value, std_err = linregress(x, y)
+        extrapolated_x = np.arange(len(self.data.cases), len(self.data.cases) + n)
+        extrapolated_y = slope * extrapolated_x + intercept
+        extrapolated_y = np.exp(extrapolated_y)
+        new_data = deepcopy(self.data)
+        new_data.append(appended_cases=extrapolated_y)
+        return slope, intercept, new_data
+
+    def plot_model(self, extrapolate=0):
         """
         Plots the fitted death curve and the predicted death statistics for a country.
         """
+        coeffs = self.fit.params
+        residuals = self.fit.residual
+
         mu, sigma = coeffs["mu"].value, coeffs["sigma"].value
-        alpha, model = model_deaths(coeffs, self.data)
+
+        fig, axs = plt.subplots(2)
+
+        if extrapolate >= 0:
+            n = extrapolate
+            slope, intercept, new_data = self.extrapolate_cases(n)
+            alpha, model = model_deaths(coeffs, new_data)
+            x = np.linspace(self.data.x[-n], self.data.x[-1] + n, num=100)
+            y = alpha*np.exp(slope * x + intercept)
+            axs[1].plot(x, y, "--", color="green", label="Extrapolated cases*alpha")
+        else:
+            alpha, model = model_deaths(coeffs, self.data)
         residuals_squared = np.sum(residuals**2)
 
         distribution = lognorm(sigma, 0, math.exp(mu))
-
-        fig, axs = plt.subplots(2)
 
         x = np.linspace(0, 40, num=300)
         y = distribution.pdf(x)
@@ -116,28 +162,25 @@ class Country:
         axs[0].grid()
         axs[0].annotate(f"$\\mu$={mu:.6f}\n$\\sigma$={sigma:.6f}\n$\\alpha$={alpha:.6f}\nres$^2$={residuals_squared:.3f}", xy=(0.7, 0.5), xycoords='axes fraction')
 
-        axs[1].plot(self.data.deaths, label="Recorded")
-        axs[1].plot(model, label="Model")
+        axs[1].plot(self.data.cases*alpha, label="Cases*alpha", color="green")
+        axs[1].plot(self.data.deaths, label="Recorded deaths", color="black")
+        axs[1].plot(model, "--", color="chocolate", label="Model")
         axs[1].set_xlabel("Number of days")
         axs[1].set_ylabel("Deaths")
         axs[1].grid()
         axs[1].xaxis.set_major_locator(plt.MultipleLocator(5))
         axs[1].legend()
 
-    def fit_model_least_squares(self):
+    def fit_model_least_squares(self, mu_guess=2., sigma_guess=0.5, mu_fixed=False, sigma_fixed=False):
         """
         Fits the values of alpha, mu, sigma using non-linear least squares method. Since residuals are linear in alpha,
         alpha can be found analytically.
         """
         params = Parameters()
-        params.add('mu', value=2., min=0.01, max=3., brute_step=0.4)
-        params.add('sigma', value=0.5, min=0.01, max=4., brute_step=0.4)
+        params.add('mu', value=mu_guess, min=0.01, max=3., vary=not mu_fixed)
+        params.add('sigma', value=sigma_guess, min=0.01, max=4., vary=not sigma_fixed)
 
-        fit = minimize(lognormal_residue, params, args=(self.data,))
-        coeffs = fit.params
-        residuals = fit.residual
-
-        self.plot_model(coeffs, residuals)
+        self.fit = minimize(lognormal_residue, params, args=(self.data,))
 
     def print_statistics(self):
         print(f"Country name: {self.country_name}\n\tTotal cases: {self.total_cases}\n\tTotal deaths: {self.total_deaths}")
@@ -226,9 +269,10 @@ def main():
 
     read_input(filename_confirmed_global_cases, filename_confirmed_global_deaths, countries)
 
-    country = countries["Germany"]
+    country = countries["US"]
     country.print_statistics()
-    country.fit_model_least_squares()
+    country.fit_model_least_squares(mu_guess=2., sigma_guess=0.3, mu_fixed=False, sigma_fixed=True)
+    country.plot_model(extrapolate=7)
 
 
 main()
