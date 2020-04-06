@@ -106,6 +106,84 @@ class Country:
         self.total_cases = int(np.round(np.sum(self.data.cases)))
         self.total_deaths = int(np.round(np.sum(self.data.deaths)))
 
+    def confidence_test_on_self(self, alpha, mu, sigma, show_cumulative=False, suppress_figure=False):
+        D_diff = np.zeros_like(self.data.cases)
+        for i in range(1, len(self.data.cases)):
+            if self.data.cases[i] > 0:
+                b_d = binom(int(self.data.cases[i]), alpha)
+                dead = b_d.rvs()
+                if dead > 0:
+                    death_distribution = lognorm(sigma, 0, math.exp(mu))
+                    dead_days = i + death_distribution.rvs(dead)
+                    for day in dead_days:
+                        if int(day) < len(self.data.cases):
+                            D_diff[int(day)] += 1
+
+        data = Data(case_statistics=self.data.cases, death_statistics=D_diff)
+        self.fit_model_least_squares(overwrite_data=data)
+        mu_guess = self.fit.params["mu"]
+        sigma_guess = self.fit.params["sigma"]
+        alpha_guess, model = model_deaths(self.fit.params, data)
+
+        print(f"Actual parameters:\n\talpha = {alpha:.6f}\n\tmu = {mu:.6f}\n\tsigma = {sigma:.6f}")
+        print(f"Predicted parameters:\n\talpha = {alpha_guess:.6f}\n\tmu = {mu_guess.value:.6f}\n\tsigma = {sigma_guess.value:.6f}")
+        print(f"Predicted parameter errors:\n\tmu = {mu_guess.stderr:.6f}\n\tsigma = {sigma_guess.stderr:.6f}")
+
+        if not suppress_figure:
+            fig, axs = plt.subplots(2)
+
+            distribution = lognorm(sigma, 0, math.exp(mu))
+
+            x = np.linspace(0, 40, num=300)
+            y = distribution.pdf(x)
+
+            distribution_predicted = lognorm(sigma_guess.value, 0, math.exp(mu_guess.value))
+            y_predicted = distribution_predicted.pdf(x)
+
+            axs[0].set_title("Death distribution")
+            axs[0].plot(x, y, alpha=0.7, lw=2,
+                        label=f"actual\n$\\alpha$={alpha:.3f}\n$\\mu$={mu:.3f}\n$\\sigma$={sigma:.3f}")
+            axs[0].plot(x, y_predicted, alpha=0.7, lw=2,
+                        label=f"predicted\n$\\alpha$={alpha_guess:.3f}\n$\\mu$={mu_guess.value:.3f}$\\pm${mu_guess.stderr:.2f}\n$\\sigma$={sigma_guess.value:.3f}$\\pm${sigma_guess.stderr:.2f}")
+            axs[0].xaxis.set_major_locator(plt.MultipleLocator(5))
+            axs[0].xaxis.set_minor_locator(plt.MultipleLocator(1))
+            axs[0].set_ylabel("Probability")
+            axs[0].legend()
+            axs[0].grid(linestyle="--")
+            for spine in ('top', 'right'):
+                axs[0].spines[spine].set_visible(False)
+
+            # self.data = Data(case_statistics=np.cumsum(I_diff[:len(model)]*alpha), death_statistics=np.cumsum(D_diff[:len(model)]))
+            # slope, intercept, new_data = self.extrapolate_cases(30, 40)
+
+            if show_cumulative:
+                axs[1].plot(self.data.x, np.cumsum(self.data.cases) * alpha, 'b', alpha=0.5, lw=2,
+                            label='Cases*alpha')
+                axs[1].plot(self.data.x, np.cumsum(D_diff), 'r', alpha=0.5, lw=2, label='Dead')
+                axs[1].plot(self.data.x, np.cumsum(model), 'g--', alpha=0.5, lw=2, label='Predicted dead')
+            else:
+                axs[1].plot(self.data.x, self.data.cases * alpha, 'b', alpha=0.5, lw=2, label='Cases*alpha')
+                axs[1].plot(self.data.x, D_diff, 'r', alpha=0.5, lw=2, label='Dead')
+                axs[1].plot(self.data.x, model, 'g--', alpha=0.5, lw=2, label='Predicted dead')
+            axs[1].set_xlabel('Time /days')
+            axs[1].yaxis.set_tick_params(length=0)
+            axs[1].xaxis.set_tick_params(length=0)
+            l1, l2 = 5, 1
+            if len(model) > 100:
+                l1, l2 = 10, 2
+            if len(model) > 200:
+                l1, l2 = 20, 4
+            axs[1].xaxis.set_major_locator(plt.MultipleLocator(l1))
+            axs[1].xaxis.set_minor_locator(plt.MultipleLocator(l2))
+
+            axs[1].grid(which='major', ls='--')
+            axs[1].legend()
+            for spine in ('top', 'right'):
+                axs[1].spines[spine].set_visible(False)
+            plt.show()
+
+        return alpha_guess, mu_guess.value, sigma_guess.value
+
     def confidence_test(self, N, alpha, mu, sigma, show_cumulative=False, peak_offset_cutoff=np.inf, suppress_figure=False):
         # Total population, N.
         # Initial number of infected and recovered individuals, I0 and R0.
@@ -140,8 +218,8 @@ class Country:
                     death_distribution = lognorm(sigma, 0, math.exp(mu))
                     dead_days = i + death_distribution.rvs(dead)
                     for day in dead_days:
-                        if int(np.round(day)) <= t_max:
-                            D_diff[int(np.round(day))] += 1
+                        if int(day) <= t_max:
+                            D_diff[int(day)] += 1
 
         peak_day = t[np.argmax(I_diff)]
         final_day = peak_day + peak_offset_cutoff
@@ -314,6 +392,8 @@ class Country:
         if overwrite_data is not None:
             data = overwrite_data
         self.fit = minimize(lognormal_residue, params, args=(data,))
+        alpha, _ = model_deaths(self.fit.params, data)
+        return alpha, self.fit.params["mu"].value, self.fit.params["sigma"].value
 
     def print_statistics(self):
         print(f"Country name: {self.country_name}\n\tTotal cases: {self.total_cases}\n\tTotal deaths: {self.total_deaths}")
@@ -404,38 +484,45 @@ def main():
 
     read_input(filename_confirmed_global_cases, filename_confirmed_global_deaths, countries)
 
-    country = countries["Hubei"]
+    country = countries["Spain"]
     country.print_statistics()
-    country.fit_model_least_squares(mu_guess=2., sigma_guess=0.3, mu_fixed=False, sigma_fixed=False)
+    alpha0, mu0, sigma0 = country.fit_model_least_squares(mu_guess=1., sigma_guess=0.3, mu_fixed=False, sigma_fixed=False)
     country.plot_model(extrapolate=7, show_cumulative=False)
+    plt.show()
     #country.confidence_test(N=1000000, alpha=0.05, mu=2., sigma=0.5, show_cumulative=True, peak_offset_cutoff=50)
 
-    if False:
+    # 0.3025, 2.8645, 2.3906
+    #         1.2684, 0.6275
+
+    if True:
         # Plots the mu-sigma phasespace for SIR monte-carlo modelled data set with constant cut-off offset from the cases peak
-        n = 20
+        n = 100
         mus, sigmas = np.zeros(n), np.zeros(n)
-        N0, alpha0, mu0, sigma0, peak_cutoff0 = 1000000, 0.05, 2., 0.5, 7
+        #N0, alpha0, mu0, sigma0, peak_cutoff0 = 1000000, 0.05, 2., 0.5, 10
         for i in range(n):
             print(f"=====================\nRun #{i}")
-            alpha, mu, sigma = country.confidence_test(N=N0, alpha=alpha0, mu=mu0, sigma=sigma0, show_cumulative=False, peak_offset_cutoff=peak_cutoff0, suppress_figure=True)
+            #alpha, mu, sigma = country.confidence_test(N=N0, alpha=alpha0, mu=mu0, sigma=sigma0, show_cumulative=False, peak_offset_cutoff=peak_cutoff0, suppress_figure=False)
+            alpha, mu, sigma = country.confidence_test_on_self(alpha=alpha0, mu=mu0, sigma=sigma0, show_cumulative=False, suppress_figure=True)
             mus[i] = mu
             sigmas[i] = sigma
         plt.xlim(0, 4)
         plt.ylim(0, 4)
-        plt.plot(mus, sigmas, "bo", alpha=0.5, label="actual")
-        plt.plot(mu0, sigma0, "ro", label="predicted")
+        plt.plot(mus, sigmas, "bx", alpha=1., label="predicted")
+        plt.plot(mu0, sigma0, "rx", markersize=8, label="actual")
         plt.xlabel("$\\mu$")
-        plt.ylabel("$\\mu$")
-        plt.title(f"$\\alpha$={alpha0} $\\mu$={mu0} $\\sigma$={sigma0} $N$={N0}, peak cutoff offset={peak_cutoff0}days")
+        plt.ylabel("$\\sigma$")
+        #plt.title(f"$\\alpha$={alpha0} $\\mu$={mu0} $\\sigma$={sigma0} $N$={N0}, peak cutoff offset={peak_cutoff0}days")
+        plt.title(f"$\\alpha$={alpha0:.6f} $\\mu$={mu0:.6f} $\\sigma$={sigma0:.6f}\t{country.country_name}")
         plt.grid(linestyle="--")
 
         mu_mean = mus.mean()
-        mu_std = mus.std() / np.sqrt(len(mus))
+        mu_mean_std = mus.std() / np.sqrt(len(mus))
         sigma_mean = sigmas.mean()
-        sigma_std = sigmas.std() / np.sqrt(len(sigmas))
-        print(f"Predicted mu {mu_mean:.6f}, std {mu_std:.6f}")
-        print(f"Predicted sigma {sigma_mean:.6f}, std {sigma_std:.6f}")
-        plt.errorbar(mu_mean, sigma_mean, sigma_std, mu_std, color="g", label=f"predicted mean\n$\\mu$={mu_mean:.4f}$\\pm${mu_std:.4f}\n$\\sigma$={sigma_mean:.4f}$\\pm${sigma_std:.4f}")
+        sigma_mean_std = sigmas.std() / np.sqrt(len(sigmas))
+        print(f"Predicted mu {mu_mean:.6f}, std {mu_mean_std:.6f}")
+        print(f"Predicted sigma {sigma_mean:.6f}, std {sigma_mean_std:.6f}")
+        plt.errorbar(mu_mean, sigma_mean, mu_mean_std, sigma_mean_std, alpha=0.7, color="0.3", lw=3, label=f"predicted mean\n$\\mu$={mu_mean:.4f}$\\pm${mu_mean_std:.4f}\n$\\sigma$={sigma_mean:.4f}$\\pm${sigma_mean_std:.4f}")
+        plt.errorbar(mu_mean, sigma_mean, mus.std(), sigmas.std(), alpha=0.6, color="0.3", lw=1, label=f"standard deviation\n$\\Delta \\mu$={mu_mean_std:.4f}\n$\\Delta \\sigma$={sigma_mean_std:.4f}")
         plt.legend()
 
 main()
